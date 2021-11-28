@@ -23,7 +23,7 @@ typeof (app F X) B :- typeof F (fun A B), typeof X A.
 Compile and run with
 
 ```prolog
-$ ocamlfind -package angstrom -package stdio -linkpkg -g -o lp lp.ml
+$ ocamlfind ocamlc -package angstrom -package stdio -linkpkg -g -o lp lp.ml
 $ ./lp stlc.lpr
 Loaded stlc.lpr
 ?- typeof (lam f\ app f unit) T, T = fun _ a. % It can typecheck!

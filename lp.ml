@@ -1,7 +1,7 @@
 (* λProlog interpreter! *)
 
 (* Compile with:
- * $ ocamlfind -package angstrom -package stdio -linkpkg -g -o lp lp.ml
+ * $ ocamlfind ocamlc -package angstrom -package stdio -linkpkg -g -o lp lp.ml
  *)
 
 type idx = int
