@@ -7,7 +7,17 @@
 type idx = int
 type lvl = int
 
-(* should this be an object? IDK. I will have to learn objects *)
+module CPS = struct
+  type failure_cont = unit -> unit
+  type success_cont = failure_cont -> unit
+
+  type computation = failure_cont -> success_cont -> unit
+
+  let id: computation = fun fk sk -> sk fk
+  let compose f g fk sk = f fk (fun fk' -> g fk' sk)
+end
+
+
 module Names : sig
   val string_to_lvl : string -> lvl
   val lvl_to_string : lvl -> string
@@ -20,6 +30,8 @@ module Names : sig
   val comma   : lvl (* ,     *)
   val semi    : lvl (* ;     *)
   val eq      : lvl (* =     *)
+
+  val reserved_names : lvl list
 end = struct
   (* String interning utils *)
   (* All global symbols get negative number lvl ids (trick from ELPI) *)
@@ -58,6 +70,8 @@ end = struct
   let comma   = string_to_lvl ","
   let semi    = string_to_lvl ";"
   let eq      = string_to_lvl "="
+
+  let reserved_names = [cut; implies; neck; pi; sigma; comma; semi; eq]
 end
 
 module Data = struct
@@ -77,16 +91,20 @@ module Data = struct
     | VFlex of hole ref * vtm list
     | VLam of (vtm -> vtm)
   and hole =
-    | Empty of lvl
+    | Empty of { scope: lvl; susp: CPS.computation list }
     | Filled of vtm
+
+  let fresh_hole lvl = ref (Empty { scope = lvl; susp = [] })
 
   type trail =
     { mutable holes: hole ref Weak.t
-    ; mutable lvls: int array
+    ; mutable scopes: int array
+    ; mutable susps: CPS.computation list array
     ; mutable size: int }
   let trail: trail =
     { holes = Weak.create 256
-    ; lvls = Array.make 256 0
+    ; scopes = Array.make 256 0
+    ; susps = Array.make 256 []
     ; size = 0 }
 
   let fill hole tm =
@@ -96,22 +114,29 @@ module Data = struct
       let new_holes = Weak.create new_size in
       Weak.blit trail.holes 0 new_holes 0 trail.size;
       trail.holes <- new_holes;
-      let new_lvls = Array.make new_size 0 in
-      Array.blit trail.lvls 0 new_lvls 0 trail.size;
-      trail.lvls <- new_lvls
+      let new_scopes = Array.make new_size 0 in
+      Array.blit trail.scopes 0 new_scopes 0 trail.size;
+      trail.scopes <- new_scopes;
+      let new_susps = Array.make new_size [] in
+      Array.blit trail.susps 0 new_susps 0 trail.size;
+      trail.susps <- new_susps
     end;
-    let Empty lvl = !hole in
+    let Empty { scope; susp } = !hole in
     Weak.set trail.holes trail.size (Some hole);
-    Array.set trail.lvls trail.size lvl;
+    Array.set trail.scopes trail.size scope;
+    Array.set trail.susps trail.size susp;
     trail.size <- trail.size + 1;
     hole := Filled tm
 
   let backtrack_to trailmarker =
     assert (0 <= trailmarker && trailmarker <= trail.size);
     for i = trailmarker to trail.size - 1 do
-      match Weak.get trail.holes i with
-        | Some h -> h := Empty trail.lvls.(i)
+      begin match Weak.get trail.holes i with
+        | Some h ->
+            h := Empty { scope = trail.scopes.(i); susp = trail.susps.(i) }
         | None -> ()
+      end;
+      trail.susps.(i) <- []
     done;
     trail.size <- trailmarker
 
@@ -170,7 +195,7 @@ module Data = struct
           List.iter (fun arg -> add " "; go lvl true arg) (List.rev args);
           close_paren (atom && args <> [])
       | VFlex (f, args) ->
-          let Empty scope = !f in
+          let Empty { scope; susp } = !f in
           open_paren (atom && args <> []);
           (* It would be nice to have a better representation of holes *)
           add ("?[at lvl " ^ string_of_int scope ^ "]");
@@ -190,28 +215,43 @@ module Data = struct
     vtm
 end
 
-module Unify = struct
+module Unify : sig
+  val unify_or_suspend : lvl -> Data.vtm -> Data.vtm -> CPS.computation
+end = struct
   open Data
 
-  exception NotPattern
+  (* not a pattern unification problem, delay until this hole is filled *)
+  exception NotPattern of hole ref
   exception DoesNotUnify
 
-  let rec unify lvl a b = match deref a, deref b with
+  let rec unify (unsusp: CPS.computation list -> unit) lvl a b =
+    match deref a, deref b with
+    (* Rigid-rigid *)
     | VRigid(f_a, args_a), VRigid(f_b, args_b) when f_a = f_b ->
         (* must have same length args lists to be well-typed *)
         assert (List.length args_a = List.length args_b);
-        List.iter2 (unify lvl) args_a args_b
+        List.iter2 (unify unsusp lvl) args_a args_b
+
     (* Eta! *)
-    | VLam a, b -> let x = VRigid(lvl, []) in unify (lvl+1) (a x) (app b x)
-    | a, VLam b -> let x = VRigid(lvl, []) in unify (lvl+1) (app a x) (b x)
+    | VLam a, b ->
+        let x = VRigid(lvl, []) in
+        unify unsusp (lvl+1) (a x) (app b x)
+    | a, VLam b ->
+        let x = VRigid(lvl, []) in
+        unify unsusp (lvl+1) (app a x) (b x)
+
+    (* Flex-flex *)
     | VFlex(h_a, args_a), VFlex(h_b, args_b) ->
         if h_a == h_b then begin
           (* must have same length args lists to be well-typed *)
           assert (List.length args_a = List.length args_b);
           prune h_a args_a args_b
         end else unify_flex_flex lvl h_a args_a h_b args_b
-    | VFlex(h, args), b -> unify_flex lvl h args b
-    | a, VFlex(h, args) -> unify_flex lvl h args a
+
+    (* Flex-rigid *)
+    | VFlex(h, args), b -> unify_flex unsusp lvl h args b
+    | a, VFlex(h, args) -> unify_flex unsusp lvl h args a
+
     | _ -> raise DoesNotUnify
 
   and add_lambdas n tm =
@@ -222,8 +262,8 @@ module Unify = struct
     let rec helper i changed acc xs ys =
       match List.map deref xs, List.map deref ys with
         | [], [] -> if changed then
-            let Empty lvl = !hole in
-            let new_hole = ref (Empty lvl) in
+            let Empty { scope; susp } = !hole in
+            let new_hole = ref (Empty { scope; susp }) in
             let f = Hole new_hole in
             let with_args = List.fold_left (fun f x -> App(f, x)) f acc in
             let with_lams = add_lambdas i with_args in
@@ -231,47 +271,50 @@ module Unify = struct
         | VRigid(x, [])::xs, VRigid(y, [])::ys ->
             if x = y then helper (i+1) changed (Local i::acc) xs ys
             else helper (i+1) true acc xs ys
-        | _ -> raise NotPattern in
+        | _ -> raise (NotPattern hole) in
     helper 0 false [] args_a args_b
 
   (* make a map from variables to their names in the solution *)
-  and invert_spine lvl hole_lvl (spine: vtm list): lvl -> idx option =
+  and invert_spine lvl hole hole_lvl (spine: vtm list): lvl -> idx option =
     let arr = Array.make (lvl - hole_lvl) None in
     List.iteri (fun i x -> match deref x with
       | VRigid(v, []) when v >= hole_lvl && arr.(v - hole_lvl) = None ->
           arr.(v - hole_lvl) <- Some i
-      | _ -> raise NotPattern) spine;
+      | _ -> raise (NotPattern hole)) spine;
     fun v -> arr.(v - hole_lvl)
 
-  and unify_flex initial_lvl hole args soln =
-    let Empty hole_lvl = !hole in
+  and unify_flex unsusp initial_lvl hole args soln =
+    let Empty { scope = hole_lvl; susp } = !hole in
+    unsusp susp;
     let args_len = List.length args in
-    let ren = invert_spine initial_lvl hole_lvl args in
+    let ren = invert_spine initial_lvl hole hole_lvl args in
     (* ugh level math *)
     let lvl_diff = initial_lvl - (hole_lvl + args_len) in
     let rename_var lvl = function
-      | v when v < hole_lvl     -> Global v
-      | v when v >= initial_lvl -> Local (lvl - lvl_diff - v - 1)
-      | v -> match ren v with
-          | Some i -> Local (i + lvl - initial_lvl)
-          | None -> raise DoesNotUnify in
+      | v when v < hole_lvl     -> Some (Global v)
+      | v when v >= initial_lvl -> Some (Local (lvl - lvl_diff - v - 1))
+      | v -> Option.map (fun i -> Local (i + lvl - initial_lvl)) (ren v) in
     (* quote and apply the renaming to the soln *)
     let rec apply_renaming lvl tm = match deref tm with
-      | VRigid(v, xs) -> rename_args lvl (rename_var lvl v) xs
+      | VRigid(v, xs) -> begin
+          match rename_var lvl v with
+            | Some v' -> rename_args lvl v' xs
+            | None -> raise DoesNotUnify
+          end
       | VFlex(h, xs)  ->
           if h == hole then raise DoesNotUnify else (* occurs check *)
-          let Empty scope = !h in
+          let Empty { scope; susp = h_susp } = !h in
           if scope > hole_lvl then
             (* convert the extra part of its scope to explicit applications *)
-            let rec go sp_for_h tm_for_hole i =
-              if i = scope then sp_for_h, tm_for_hole
+            let rec go spine tm i =
+              if i = scope then spine, tm
               else match rename_var lvl i with
-                | v -> go (VRigid(i,[]) :: sp_for_h) (App(tm_for_hole, v)) (i+1)
-                | exception DoesNotUnify -> go sp_for_h tm_for_hole (i+1) in
-            let new_hole = ref (Empty hole_lvl) in
-            let sp_for_h, tm_for_hole = go [] (Hole new_hole) hole_lvl in
-            fill h (VFlex(new_hole, sp_for_h));
-            rename_args lvl tm_for_hole xs
+                | Some v -> go (VRigid(i,[]) :: spine) (App(tm, v)) (i+1)
+                | None -> go spine tm (i+1) in
+            let new_hole = ref (Empty { scope = hole_lvl; susp = h_susp }) in
+            let spine, tm = go [] (Hole new_hole) hole_lvl in
+            fill h (VFlex(new_hole, spine));
+            rename_args lvl tm xs
           else
             rename_args lvl (Hole h) xs
       | VLam f        -> Abs (apply_renaming (lvl+1) (f (VRigid(lvl, []))))
@@ -282,15 +325,16 @@ module Unify = struct
   and unify_flex_flex lvl h_a args_a h_b args_b =
     (* Flex-flex case of pattern unification: take the intersection of their
        arguments *)
-    let Empty lvl_a = !h_a in
-    let Empty lvl_b = !h_b in
+    let Empty { scope = lvl_a; susp = susp_a } = !h_a in
+    let Empty { scope = lvl_b; susp = susp_b } = !h_b in
     let len_args_a = List.length args_a in
     let len_args_b = List.length args_b in
-    let make_renaming l spine = let ren = invert_spine lvl l spine in fun v ->
-      if v < l then Some (Global v)
-      else Option.map (fun i -> Local i) (ren v) in
-    let ren_a = make_renaming lvl_a args_a in
-    let ren_b = make_renaming lvl_b args_b in
+    let make_renaming l hole spine =
+      let ren = invert_spine lvl hole l spine in fun v ->
+        if v < l then Some (Global v)
+        else Option.map (fun i -> Local i) (ren v) in
+    let ren_a = make_renaming lvl_a h_a args_a in
+    let ren_b = make_renaming lvl_b h_b args_b in
     let rec intersect l a b =
       if l = lvl then begin
         fill h_a (eval [] (add_lambdas len_args_a a));
@@ -298,9 +342,21 @@ module Unify = struct
       end else match ren_a l, ren_b l with
         | Some x, Some y -> intersect (l+1) (App(a,x)) (App(b,y))
         | _              -> intersect (l+1) a b in
-    let new_hole = Hole (ref (Empty (min lvl_a lvl_b))) in
+    let new_hole =
+      Hole (ref (Empty { scope = min lvl_a lvl_b; susp = susp_a @ susp_b })) in
     intersect (min lvl_a lvl_b) new_hole new_hole
 
+  let rec unify_or_suspend lvl a b fk sk =
+    let what_next = ref CPS.id in
+    let unsusp comps =
+      what_next := List.fold_right CPS.compose comps !what_next in
+    match unify unsusp lvl a b with
+      | exception DoesNotUnify -> fk ()
+      | exception (NotPattern hole) ->
+          let Empty { scope; susp } = !hole in
+          hole := Empty { scope; susp = (unify_or_suspend lvl a b)::susp };
+          !what_next fk sk
+      | () -> !what_next fk sk
 end
 
 module Runtime = struct
@@ -312,15 +368,8 @@ module Runtime = struct
     ; args: tm list
     ; body: tm list }
 
-  type env = (* lexically bound things *)
-    { locals: vtm list
-    ; cutpoint: failure_cont }
-  and ctx = (* dynamically bound things *)
-    { lvl: lvl
-    ; local_clauses: clause list }
-
-  and success_cont = failure_cont -> unit
-  and failure_cont = unit -> unit
+  (* dynamically bound things *)
+  type ctx = { lvl: lvl; local_clauses: clause list }
 
   let initial_ctx: ctx = { lvl = 0; local_clauses = [] }
 
@@ -346,13 +395,11 @@ module Runtime = struct
   end
 
   (* helper function for writing failure continuations *)
-  let backtracking (k: unit -> unit): failure_cont =
+  let backtracking (k: unit -> unit): CPS.failure_cont =
     let trailmarker = trail.size in
     fun () -> backtrack_to trailmarker; k ()
 
   let compile_to_clause base_lvl vtm =
-    let is_reserved x =
-      List.mem x Names.[cut; implies; neck; pi; sigma; comma; semi; eq] in
     let rec to_clause lvl (a: vtm): clause = match deref a with
       | VRigid(f, args) when f = Names.pi ->
           let [fn] = args in
@@ -367,7 +414,7 @@ module Runtime = struct
           let goal = quote base_lvl lvl body in
           { cls with body = goal :: cls.body }
       | VRigid(f, args) ->
-          assert (not (is_reserved f));
+          assert (not (List.mem f Names.reserved_names));
           { n_vars = 0
           ; functor_ = f
           ; args = List.map (quote base_lvl lvl) args
@@ -378,27 +425,26 @@ module Runtime = struct
 
 
   let rec exec_clause (ctx: ctx) (cls: clause) (args: vtm list) fk sk =
+    (* lexically bound state: cutpoint and env *)
     let cutpt = fk in
-    (* allocate a new env for the clause *)
     let rec make_env acc n =
       if n = 0 then acc
-      else make_env (VFlex(ref (Empty ctx.lvl), []) :: acc) (n-1) in
+      else make_env (VFlex(fresh_hole ctx.lvl, []) :: acc) (n-1) in
     let env = make_env [] cls.n_vars in
-    (* unify all the arguments *)
-    let unify_arg arg param = Unify.unify ctx.lvl arg (eval env param) in
-    match List.iter2 unify_arg args cls.args with
-      | exception Unify.DoesNotUnify -> fk ()
-      | exception Unify.NotPattern ->
-          print_endline "Non-pattern unification problem in head of clause";
-          assert false
-      | () ->
-          (* run the body *)
-          let run_one x = exec_goal ctx cutpt (eval env x) in
-          let rec run_body fk = function
-            | [] -> sk fk
-            | [x] -> run_one x fk sk
-            | x::xs -> run_one x fk (fun fk' -> run_body fk' xs) in
-          run_body fk cls.body
+    (* unify the arguments *)
+    let rec unify_args args params fk sk = match args, params with
+      | [], [] -> sk fk
+      | a::args, p::params ->
+          Unify.unify_or_suspend ctx.lvl a (eval env p) fk (fun fk' ->
+            unify_args args params fk' sk) in
+    unify_args args cls.args fk (fun fk ->
+      (* run the body *)
+      let run_one x = exec_goal ctx cutpt (eval env x) in
+      let rec run_body fk = function
+        | [] -> sk fk
+        | [x] -> run_one x fk sk
+        | x::xs -> run_one x fk (fun fk' -> run_body fk' xs) in
+      run_body fk cls.body)
 
   and exec_goal (ctx: ctx) cutpt vtm fk sk = match deref vtm with
     | VRigid(f, args) when f = Names.cut ->
@@ -413,8 +459,7 @@ module Runtime = struct
     | VRigid(f, args) when f = Names.sigma ->
         (* sigma X\ goal: make a new hole X and exec goal *)
         let [fn] = args in
-        let new_hole = VFlex(ref (Empty ctx.lvl), []) in
-        exec_goal ctx cutpt (app fn new_hole) fk sk
+        exec_goal ctx cutpt (app fn (VFlex(fresh_hole ctx.lvl, []))) fk sk
     | VRigid(f, args) when f = Names.implies || f = Names.neck ->
         (* hyp => goal: add hyp as a local clause and exec goal *)
         let hyp, goal =
@@ -436,15 +481,7 @@ module Runtime = struct
     | VRigid(f, args) when f = Names.eq ->
         (* lhs = rhs: unify the terms! *)
         let [rhs; lhs] = args in
-        begin match Unify.unify ctx.lvl lhs rhs with
-          | exception Unify.DoesNotUnify -> fk ()
-          | exception Unify.NotPattern ->
-              print_endline "Non-pattern unification problem:";
-              print_endline ("  " ^ Data.to_string ctx.lvl lhs);
-              print_endline ("  " ^ Data.to_string ctx.lvl rhs);
-              assert false
-          | () -> sk fk
-        end
+        Unify.unify_or_suspend ctx.lvl lhs rhs fk sk
     | VRigid(f, args) ->
         (* User-defined predicate: try each clause *)
         let rec go = function
@@ -470,7 +507,7 @@ module Interactive = struct
 
   let interact (goal: user_goal) =
     let rec make_env acc n =
-      if n = 0 then acc else make_env (VFlex(ref (Empty 0), []) :: acc) (n-1) in
+      if n = 0 then acc else make_env (VFlex(fresh_hole 0, []) :: acc) (n-1) in
     let env = make_env [] goal.free_count in
     let sk fk =
       print_endline "yes.";
