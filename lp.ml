@@ -140,18 +140,6 @@ module Data = struct
     done;
     trail.size <- trailmarker
 
-  let rec eval (env: vtm list) = function
-    | Local i -> List.nth env i
-    | Global lvl -> VRigid(lvl, [])
-    | App(f, x) ->
-        begin match eval env f, eval env x with
-          | VFlex (h, args), x' -> VFlex (h, x'::args)
-          | VRigid(x, args), x' -> VRigid(x, x'::args)
-          | VLam f', x' -> f' x'
-        end
-    | Abs tm -> VLam (fun x -> eval (x::env) tm)
-    | Hole h -> VFlex(h, [])
-
   let app f x = match f with
     | VFlex (h, args) -> VFlex (h, x::args)
     | VRigid(h, args) -> VRigid(h, x::args)
@@ -166,6 +154,13 @@ module Data = struct
     | VFlex({ contents = Filled tm }, args) ->
         app_spine (deref tm) args
     | x -> x
+
+  let rec eval (env: vtm list) = function
+    | Local i -> List.nth env i
+    | Global lvl -> VRigid(lvl, [])
+    | App(f, x) -> app (eval env f) (eval env x)
+    | Abs tm -> VLam (fun x -> eval (x::env) tm)
+    | Hole h -> deref (VFlex(h, []))
 
   let quote base_lvl lvl vtm =
     let rec go lvl x = match deref x with
