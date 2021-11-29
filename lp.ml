@@ -472,12 +472,14 @@ module Interactive = struct
     let rec make_env acc n =
       if n = 0 then acc else make_env (VFlex(ref (Empty 0), []) :: acc) (n-1) in
     let env = make_env [] goal.free_count in
-    (* TODO: prompt user for more solutions? *)
-    let sk _fk =
+    let sk fk =
       print_endline "yes.";
       Hashtbl.iter (fun name l ->
         let x = List.nth env (goal.free_count - l - 1) in
-        print_endline (" " ^ name ^ " = " ^ Data.to_string 0 x)) goal.vars in
+        print_endline (" " ^ name ^ " = " ^ Data.to_string 0 x);
+        print_string "more? "; flush stdout;
+        let resp = read_line () in
+        if List.mem resp ["y"; "yes"; ";"] then fk ()) goal.vars in
     let fk () = print_endline "no." in
     Runtime.exec_goal Runtime.initial_ctx fk (eval env goal.term) fk sk
 end
